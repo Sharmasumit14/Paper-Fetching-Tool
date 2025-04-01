@@ -3,12 +3,17 @@ Core module for fetching papers from PubMed with pharmaceutical/biotech affiliat
 """
 
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict
 import xml.etree.ElementTree as ET
 import requests
 from pydantic import BaseModel, Field
 from dateutil.parser import parse
+import time
+from pathlib import Path
+import json
+import logging
 
+logger = logging.getLogger(__name__)
 
 class Author(BaseModel):
     """Represents an author with their affiliations."""
@@ -33,156 +38,174 @@ class PubMedFetcher:
     """Handles fetching and processing papers from PubMed."""
     
     BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+    CACHE_DIR = Path.home() / ".pubmed_paper_fetcher" / "cache"
+    CACHE_EXPIRY = 24 * 60 * 60  # 24 hours in seconds
+    RATE_LIMIT_DELAY = 0.34  # seconds between requests (PubMed limit: 3 requests/second)
     
     def __init__(self, debug: bool = False):
         self.debug = debug
+        self.session = requests.Session()
+        self.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        self._last_request_time = 0
     
-    def _log(self, message: str) -> None:
-        """Log debug messages if debug mode is enabled."""
-        if self.debug:
-            print(f"[DEBUG] {message}")
+    def _rate_limit(self):
+        """Ensure we don't exceed PubMed's rate limit"""
+        current_time = time.time()
+        time_since_last_request = current_time - self._last_request_time
+        if time_since_last_request < self.RATE_LIMIT_DELAY:
+            time.sleep(self.RATE_LIMIT_DELAY - time_since_last_request)
+        self._last_request_time = time.time()
     
-    def _fetch_paper_details(self, pmid: str) -> dict:
-        """Fetch detailed information for a specific paper."""
-        url = f"{self.BASE_URL}/efetch.fcgi"
-        params = {
-            "db": "pubmed",
-            "id": pmid,
-            "retmode": "xml"
-        }
-        
-        self._log(f"Fetching details for PMID: {pmid}")
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        
-        # Parse XML response
-        root = ET.fromstring(response.content)
-        article = root.find(".//Article")
-        if article is None:
-            return {}
-        
-        # Extract basic information
-        title = article.find(".//ArticleTitle")
-        title = title.text if title is not None else ""
-        
-        # Extract publication date
-        pub_date = article.find(".//PubDate")
-        if pub_date is not None:
-            year = pub_date.find("Year")
-            month = pub_date.find("Month")
-            day = pub_date.find("Day")
-            pub_date_str = f"{year.text if year is not None else '2025'}-{month.text if month is not None else '01'}-{day.text if day is not None else '01'}"
-        else:
-            pub_date_str = "2025-01-01"
-        
-        # Extract authors and affiliations
-        authors = []
-        for author_elem in article.findall(".//Author"):
-            name_parts = []
-            last_name = author_elem.find("LastName")
-            fore_name = author_elem.find("ForeName")
-            if last_name is not None:
-                name_parts.append(last_name.text)
-            if fore_name is not None:
-                name_parts.append(fore_name.text)
-            
-            name = " ".join(name_parts) if name_parts else ""
-            
-            # Get affiliations
-            affiliations = []
-            for aff in author_elem.findall(".//Affiliation"):
-                if aff.text:
-                    affiliations.append(aff.text)
-            
-            # Check if author is corresponding
-            is_corresponding = False
-            email = None
-            for aff in affiliations:
-                if "@" in aff:
-                    email = aff.split("@")[0] + "@" + aff.split("@")[1].split()[0]
-                    is_corresponding = True
-            
-            authors.append({
-                "name": name,
-                "affiliations": affiliations,
-                "email": email,
-                "is_corresponding": is_corresponding
-            })
-        
-        return {
-            "uid": pmid,
-            "title": title,
-            "pubdate": pub_date_str,
-            "authors": authors
-        }
-    
-    def _extract_company_affiliations(self, affiliations: List[str]) -> List[str]:
-        """Extract pharmaceutical/biotech company affiliations."""
-        company_keywords = [
-            "pharmaceutical", "biotech", "biotechnology", "pharma",
-            "therapeutics", "biosciences", "laboratories", "inc.", "corp.",
-            "corporation", "ltd.", "limited", "llc", "gmbh"
-        ]
-        company_affs = []
-        for aff in affiliations:
-            if any(keyword.lower() in aff.lower() for keyword in company_keywords):
-                # Clean up the affiliation string
-                clean_aff = aff.split(",")[0].strip()  # Take first part before comma
-                if clean_aff:
-                    company_affs.append(clean_aff)
-        return company_affs
-    
-    def _process_paper(self, paper_data: dict) -> Optional[Paper]:
-        """Process raw paper data into a Paper object."""
-        try:
-            # Extract basic information
-            uid = paper_data.get("uid", "")
-            title = paper_data.get("title", "")
-            pub_date = parse(paper_data.get("pubdate", ""))
-            
-            # Process authors and affiliations
-            authors = []
-            non_academic_authors = []
-            company_affiliations = []
-            corresponding_email = None
-            
-            # Extract author information from the paper data
-            author_list = paper_data.get("authors", [])
-            
-            for author_data in author_list:
-                author = Author(
-                    name=author_data.get("name", ""),
-                    affiliations=author_data.get("affiliations", []),
-                    email=author_data.get("email"),
-                    is_corresponding=author_data.get("is_corresponding", False)
-                )
-                authors.append(author)
-                
-                if author.is_corresponding:
-                    corresponding_email = author.email
-                
-                # Check for non-academic affiliations
-                company_affs = self._extract_company_affiliations(author.affiliations)
-                if company_affs:
-                    non_academic_authors.append(author.name)
-                    company_affiliations.extend(company_affs)
-            
-            # Only return papers that have at least one company affiliation
-            if not company_affiliations:
-                return None
-            
-            return Paper(
-                pubmed_id=uid,
-                title=title,
-                publication_date=pub_date,
-                authors=authors,
-                non_academic_authors=non_academic_authors,
-                company_affiliations=list(set(company_affiliations)),
-                corresponding_author_email=corresponding_email
-            )
-        except Exception as e:
-            self._log(f"Error processing paper: {str(e)}")
+    def _get_cached_data(self, pmid: str) -> Optional[Dict]:
+        """Get cached paper data if available and not expired"""
+        cache_file = self.CACHE_DIR / f"{pmid}.json"
+        if not cache_file.exists():
             return None
+
+        try:
+            with open(cache_file, 'r') as f:
+                data = json.load(f)
+                if time.time() - data['timestamp'] > self.CACHE_EXPIRY:
+                    return None
+                return data['paper']
+        except Exception as e:
+            logger.warning(f"Error reading cache for PMID {pmid}: {e}")
+            return None
+    
+    def _cache_data(self, pmid: str, paper_data: Dict):
+        """Cache paper data with timestamp"""
+        try:
+            cache_file = self.CACHE_DIR / f"{pmid}.json"
+            with open(cache_file, 'w') as f:
+                json.dump({
+                    'timestamp': time.time(),
+                    'paper': paper_data
+                }, f)
+        except Exception as e:
+            logger.warning(f"Error caching data for PMID {pmid}: {e}")
+    
+    def _make_request(self, endpoint: str, params: Dict) -> requests.Response:
+        """Make a request to PubMed API with retries and error handling"""
+        max_retries = 3
+        retry_delay = 1
+
+        for attempt in range(max_retries):
+            try:
+                self._rate_limit()
+                response = self.session.get(f"{self.BASE_URL}/{endpoint}", params=params)
+                response.raise_for_status()
+                return response
+            except requests.exceptions.RequestException as e:
+                if attempt == max_retries - 1:
+                    raise
+                logger.warning(f"Request failed (attempt {attempt + 1}/{max_retries}): {e}")
+                time.sleep(retry_delay * (attempt + 1))
+    
+    def _fetch_paper_details(self, pmid: str) -> Optional[Paper]:
+        """Fetch detailed paper information from PubMed"""
+        # Check cache first
+        cached_data = self._get_cached_data(pmid)
+        if cached_data:
+            return Paper(**cached_data)
+
+        try:
+            params = {
+                "db": "pubmed",
+                "id": pmid,
+                "retmode": "xml"
+            }
+            
+            response = self._make_request("efetch.fcgi", params)
+            root = ET.fromstring(response.content)
+            
+            # Extract article information
+            article = root.find(".//PubmedArticle")
+            if article is None:
+                return None
+
+            # Get title
+            title_elem = article.find(".//ArticleTitle")
+            title = title_elem.text if title_elem is not None else "No title available"
+
+            # Get publication date
+            pub_date = article.find(".//PubDate")
+            if pub_date is not None:
+                year = pub_date.find("Year").text if pub_date.find("Year") is not None else "Unknown"
+                month = pub_date.find("Month").text if pub_date.find("Month") is not None else "01"
+                day = pub_date.find("Day").text if pub_date.find("Day") is not None else "01"
+                publication_date = datetime.strptime(f"{year}-{month}-{day}", "%Y-%m-%d")
+            else:
+                publication_date = datetime.now()
+
+            # Get authors and affiliations
+            authors = []
+            company_affiliations = []
+            corresponding_author_email = None
+
+            author_list = article.find(".//AuthorList")
+            if author_list is not None:
+                for author in author_list.findall("Author"):
+                    last_name = author.find("LastName")
+                    first_name = author.find("ForeName")
+                    if last_name is not None and first_name is not None:
+                        authors.append(f"{first_name.text} {last_name.text}")
+
+                    # Check for corresponding author email
+                    if author.find("AffiliationInfo") is not None:
+                        for affil in author.findall(".//AffiliationInfo"):
+                            affil_text = affil.find("Affiliation").text if affil.find("Affiliation") is not None else ""
+                            if "@" in affil_text:
+                                corresponding_author_email = affil_text
+                                break
+
+            # Extract company affiliations
+            affiliations = article.findall(".//AffiliationInfo")
+            for affil in affiliations:
+                affil_text = affil.find("Affiliation").text if affil.find("Affiliation") is not None else ""
+                if self._is_company_affiliation(affil_text):
+                    company_affiliations.append(affil_text)
+
+            paper = Paper(
+                pubmed_id=pmid,
+                title=title,
+                publication_date=publication_date,
+                authors=authors,
+                non_academic_authors=authors,
+                company_affiliations=company_affiliations,
+                corresponding_author_email=corresponding_author_email
+            )
+
+            # Cache the paper data
+            self._cache_data(pmid, paper.dict())
+
+            return paper
+
+        except Exception as e:
+            logger.error(f"Error fetching details for PMID {pmid}: {e}")
+            return None
+    
+    def _is_company_affiliation(self, affiliation: str) -> bool:
+        """Check if the affiliation is from a pharmaceutical or biotech company"""
+        company_keywords = [
+            "pharmaceutical", "biotech", "biotechnology", "pharma", "drug company",
+            "biopharmaceutical", "biopharma", "pharmaceuticals", "biopharmaceuticals",
+            "pharmaceutical company", "biotech company", "biotechnology company",
+            "drug development", "drug discovery", "clinical development",
+            "research and development", "R&D", "research & development"
+        ]
+        
+        affiliation_lower = affiliation.lower()
+        return any(keyword in affiliation_lower for keyword in company_keywords)
+    
+    def _process_paper(self, pmid: str) -> Optional[Paper]:
+        """Process a single paper and return if it has company affiliations"""
+        if self.debug:
+            logger.info(f"Fetching details for PMID: {pmid}")
+        
+        paper = self._fetch_paper_details(pmid)
+        if paper and paper.company_affiliations:
+            return paper
+        return None
     
     def fetch_papers(self, query: str, max_results: int = 100) -> List[Paper]:
         """
@@ -195,32 +218,37 @@ class PubMedFetcher:
         Returns:
             List of Paper objects
         """
-        # First, search for papers
-        search_url = f"{self.BASE_URL}/esearch.fcgi"
-        search_params = {
-            "db": "pubmed",
-            "term": query,
-            "retmode": "json",
-            "retmax": max_results
-        }
-        
-        self._log(f"Searching PubMed with query: {query}")
-        response = requests.get(search_url, params=search_params)
-        response.raise_for_status()
-        
-        search_results = response.json()
-        pmids = search_results.get("esearchresult", {}).get("idlist", [])
-        
-        # Fetch details for each paper
-        papers = []
-        for pmid in pmids:
-            try:
-                paper_data = self._fetch_paper_details(pmid)
-                paper = self._process_paper(paper_data)
+        if self.debug:
+            logger.info(f"Searching PubMed for: {query}")
+
+        try:
+            # First, get the list of PMIDs
+            search_params = {
+                "db": "pubmed",
+                "term": query,
+                "retmode": "json",
+                "retmax": min(max_results, 1000)  # PubMed's maximum is 1000
+            }
+            
+            response = self._make_request("esearch.fcgi", search_params)
+            search_data = response.json()
+            
+            if "esearchresult" not in search_data or "idlist" not in search_data["esearchresult"]:
+                logger.error("No results found or invalid response format")
+                return []
+
+            pmids = search_data["esearchresult"]["idlist"][:max_results]
+            papers = []
+
+            for pmid in pmids:
+                paper = self._process_paper(pmid)
                 if paper:
                     papers.append(paper)
-            except Exception as e:
-                self._log(f"Error fetching paper {pmid}: {str(e)}")
-                continue
-        
-        return papers 
+                    if len(papers) >= max_results:
+                        break
+
+            return papers
+
+        except Exception as e:
+            logger.error(f"Error fetching papers: {e}")
+            return [] 
